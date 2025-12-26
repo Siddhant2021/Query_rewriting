@@ -1,0 +1,26 @@
+import json
+from pathlib import Path
+
+input_files = [
+    "human/retrieval_tasks/clapnq/clapnq_lastturn.jsonl",
+    "human/retrieval_tasks/fiqa/fiqa_lastturn.jsonl",
+    "human/retrieval_tasks/cloud/cloud_lastturn.jsonl",
+    "human/retrieval_tasks/govt/govt_lastturn.jsonl",
+]
+
+output_file = "all_queries.jsonl"
+
+with open(output_file, "w", encoding="utf-8") as out_f:
+    for file_path in input_files:
+        file_path = Path(file_path)
+
+        with file_path.open("r", encoding="utf-8") as in_f:
+            for line in in_f:
+                record = json.loads(line)
+                text = record.get("text", "")
+
+                if text.startswith("|user|:"):
+                    query = text.replace("|user|:", "").strip()
+                    out_f.write(json.dumps({"query": query}) + "\n")
+
+print(f"✅ Queries written to {output_file}")
