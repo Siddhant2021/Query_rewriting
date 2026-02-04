@@ -1,0 +1,521 @@
+Postgres as a search engine
+August 19, 2024
+/
+15 minute read
+Search is hard. It’s a critical part of many apps, but getting it right isn’t easy. This is especially true for RAG-pipelines where the quality of retrieval can make or break the entire process.
+
+While semantic search is trendy, good old lexical search is still the backbone. Semantic techniques can improve results, but they work best when added to a solid text-based search foundation.
+
+In this post, we’ll explore how to use Postgres to create a robust search engine. We’ll combine three techniques:
+
+Full-text search with tsvector
+Semantic search with pgvector
+Fuzzy matching with pg_trgm
+Bonus: BM25
+This approach might not be the absolute best for every situation, but it’s a great alternative to setting up a separate search service. It’s a solid starting point that you can implement and scale within your existing Postgres database.
+
+I won’t go into why you should Just Use Postgres™️ for everything, but if you want to read about it, here are a couple of good resources:
+
+Postgres is all you need, even for vectors
+Just Use Postgres for Everythingfavicon for www.amazingcto.com
+PostgreSQL is Enoughfavicon for gist.github.com
+Table with four legs
+This is the table we’ll work with as an example.
+
+create table documents (
+
+    id bigint primary key generated always as identity,
+
+    title text,
+
+    fts_title tsvector generated always as (to_tsvector('english', title)) stored,
+
+    embedding vector(1536)
+
+);
+We’ll evolve this table down the road. Since Supabase has a great article on implementing hybrid search, we’ll use that as a starting point. Hybrid searchfavicon for supabase.com
+
+Follow the guide to implement FTS with GIN-indexes and semantic search with pgvector (also known as bi-encoder dense retrieval).
+From personal experience, I’d opt for 1536 dimensional embeddings since it’s gotten me way better results. Source: trust me.
+I’ve replaced the Supabase function with just CTEs and a query, as well as prefixed the params with $. Here’s what it’ll look like:
+with full_text as (
+
+    select
+
+        id,
+
+        -- Note: ts_rank_cd is not indexable but will only rank matches of the where clause
+
+        -- which shouldn't be too big
+
+        row_number() over(order by ts_rank_cd(fts_title, websearch_to_tsquery($query_text)) desc) as rank_ix
+
+    from
+
+        documents
+
+    where
+
+        fts_title @@ websearch_to_tsquery($query_text)
+
+    order by rank_ix
+
+    limit least($match_count, 30)
+
+),
+
+semantic as (
+
+    select
+
+        id,
+
+        row_number() over (order by embedding <#> $query_embedding) as rank_ix
+
+    from
+
+        documents
+
+    order by rank_ix
+
+    limit least($match_count, 30)
+
+)
+
+select
+
+    documents.*
+
+from
+
+    full_text
+
+    full outer join semantic
+
+        on full_text.id = semantic.id
+
+    join documents
+
+        on coalesce(full_text.id, semantic.id) = documents.id
+
+order by
+
+    coalesce(1.0 / ($rrf_k + full_text.rank_ix), 0.0) * $full_text_weight +
+
+    coalesce(1.0 / ($rrf_k + semantic.rank_ix), 0.0) * $semantic_weight
+
+    desc
+
+limit
+
+    least($match_count, 30);
+Note: We’re using coalesce in several places for important reasons:
+
+In the join clause:
+
+join documents
+
+    on coalesce(full_text.id, semantic.id) = documents.id
+This ensures that we include results from both full-text and semantic searches, even if a document appears in only one of these result sets. If a document is found by full-text search but not by semantic search (or vice versa), we still want to include it.
+
+In the order by clause:
+
+coalesce(1.0 / ($rrf_k + full_text.rank_ix), 0.0) * $full_text_weight +
+
+coalesce(1.0 / ($rrf_k + semantic.rank_ix), 0.0) * $semantic_weight
+This handles cases where a document might be present in one search result but not the other. If a document isn’t in the full-text results, its full_text.rank_ix will be NULL, so we use coalesce to treat it as 0.0 in the ranking calculation. The same applies for semantic search results.
+
+Here we’re using Reciprocal Ranked Fusion (RRF) to merge the results.
+
+List 3
+List 2
+List 1
+A
+B
+C
+B
+C
+A
+C
+A
+B
+RRF
+Final Ranking
+A
+B
+C
+This method ensures that items ranked high in multiple lists are given a high rank in the final list. It also ensures that items ranked high in only a few lists but low in others are not given a high rank in the final list. Placing the rank in the denominator when calculating score helps penalize the low ranking records.
+
+It’s also worth noting:
+
+$rrf_k: To prevent extremely high scores for items ranked first (since we’re dividing by the rank), a k constant is often added to the denominator to smooth the score.
+$ _weight: We can assign a weight to each method. This is very useful when you’re tuning the results.
+Implementing fuzzy search
+While this gets us a long way, an immediate issue will be typos in named entities. While semantic search eliminates some of these issues by capturing similarity, it struggles to do so for names, acronyms, and other text that’s not semantically similar. To mitigate this, we’ll introduce the pg_trgm extension to allow for fuzzy searching.
+
+It operates with Trigrams. Here’s how it works:
+
+Trigrams
+
+Trigrams are useful for fuzzy search because they break down words into three-character sequences. This allows for matching similar words even if they contain typos or slight variations. For example, “hello” and “helo” share many trigrams, making them easier to match in a fuzzy search.
+
+You have to create a new index for the desired column like this:
+
+After that, you need to add it to the full search query. The extension exposes the % operator to filter out text where similarity is larger than pg_trgm.similarity_threshold (default is 0.3). There are also several other operators that are useful. Everything is well documented here: pg_trgm — support for similarity of text using trigram matchingfavicon for www.postgres.org
+
+Here’s the new query with fuzzy searching implemented:
+
+with fuzzy as ( 
+
+    select id,
+
+           similarity(title, $query_text) as sim_score,
+
+           row_number() over (order by similarity(title, $query_text) desc) as rank_ix
+
+    from documents
+
+    where title % $query_text
+
+    order by rank_ix
+
+    limit least($match_count, 30)
+
+),
+
+full_text as (
+
+    select id,
+
+           ts_rank_cd(to_tsvector('english', title), websearch_to_tsquery($query_text)) as rank_score,
+
+           row_number() over (order by ts_rank_cd(to_tsvector('english', title), websearch_to_tsquery($query_text)) desc) as rank_ix
+
+    from documents
+
+    where to_tsvector('english', title) @@ websearch_to_tsquery($query_text)
+
+    order by rank_ix
+
+    limit least($match_count, 30)
+
+),
+
+semantic as (
+
+    select id,
+
+           row_number() over (order by embedding <#> $query_embedding) as rank_ix
+
+    from documents
+
+    order by rank_ix
+
+    limit least($match_count, 30)
+
+)
+
+select documents.*
+
+from fuzzy
+
+full outer join full_text on fuzzy.id = full_text.id
+
+full outer join semantic on coalesce(fuzzy.id, full_text.id) = semantic.id
+
+join documents on coalesce(fuzzy.id, full_text.id, semantic.id) = documents.id
+
+order by
+
+    coalesce(1.0 / ($rrf_k + fuzzy.rank_ix), 0.0) * $fuzzy_weight +
+
+    coalesce(1.0 / ($rrf_k + full_text.rank_ix), 0.0) * $full_text_weight +
+
+    coalesce(1.0 / ($rrf_k + semantic.rank_ix), 0.0) * $semantic_weight
+
+desc
+
+limit least($match_count, 30);
+Debugging the rankings
+When getting the results back, it’s very useful to understand why something matched and not. First, we need to ensure we’re returning all scores from the various CTEs.
+
+semantic as (
+
+  select id,
+
+  1 - (embedding <=> $query_embedding) as cosine_similarity, 
+
+)
+Next, we need to actually include it in the final response. I’ve found it useful to store as a JSON object that you can pass around however you want.
+
+select
+
+  ...
+
+  json_build_object(
+
+      'fuzzy', json_build_object('rank_ix', fuzzy.rank_ix, 'sim_score', fuzzy.sim_score),
+
+      'full_text', json_build_object('rank_ix', full_text.rank_ix, 'rank_score', full_text.rank_score),
+
+      'semantic', json_build_object('rank_ix', semantic.rank_ix, 'cosine_similarity', semantic.cosine_similarity)
+
+  ) as rankings
+
+...
+Here’s what it’ll look like:
+
+{
+
+  "rankings": {
+
+    "fuzzy": {
+
+      "rank_ix": 5,
+
+      "sim_score": 0.6
+
+    },
+
+    "full_text": {
+
+      "rank_ix": 4,
+
+      "rank_score": 0.756
+
+    },
+
+    "semantic": {
+
+      "rank_ix": 1,
+
+      "cosine_similarity": 0.912
+
+    }
+
+  }
+
+}
+Tuning full text search
+Weighing tsvectors
+Now, your actual documents might actually include some content and not just a title. Let’s go ahead and add a body column.
+
+create table documents (
+
+    id bigint primary key generated always as identity,
+
+    title text,
+
+    body text, 
+
+    fts_title tsvector generated always as (to_tsvector('english', title)) stored, 
+
+    fts_body tsvector generated always as (to_tsvector('english', body)) stored, 
+
+    embedding vector(1536)
+
+);
+As you can see, we’ll only keep a single embedding column even though we have multiple fields. Personally, I’ve found no significant performance in keeping multiple embeddings, but instead keeping both title and body in the same. After all, the title should™️ be a short representation of the body. I encourage you to experiment with this based on your needs.
+
+Now, let’s look at the fts_ columns. We expect the title to be short and keyword-rich, while the body will be longer and include more details. Thus we need to adjust how the full text search columns are weighed against each other. Read the docs to get a better understanding here: 12.3.3. Ranking Search Resultsfavicon for www.postgres.org. Here’s the tl;dr:
+
+Weights allow prioritizing words based on their location or importance in the document.
+A-weight: Most important (e.g., title, headers). Default 1.0
+B-weight: Important (e.g., beginning of document, abstract). Default 0.4
+C-weight: Standard importance (e.g., main body text). Default 0.2
+D-weight: Least important (e.g., footnotes, annotations). Default 0.1
+Adjust weights to fine-tune relevance based on document structure and application needs.
+The title is given more weight than the body because it’s typically a concise representation of the document’s main topic. Users often scan titles first when searching, so matching keywords in the title are usually more relevant to the user’s intent than matches in the body text.
+
+With this information, we can go ahead and update the indexes:
+
+create table documents (
+
+    id bigint primary key generated always as identity,
+
+    title text,
+
+    body text,
+
+    fts_title tsvector generated always as (setweight(to_tsvector('english', coalesce(title, '')), 'A')) stored, 
+
+    fts_body tsvector generated always as (setweight(to_tsvector('english', coalesce(body, '')), 'C')) stored, 
+
+    embedding vector(1536)
+
+);
+This will make the title have a weight of 1.0 and body a weight of 0.2.
+
+Like before, we’ll add the new fts_body to the final query. I’ve also renamed the previous full_text to fts_title.
+
+...
+
+fts_body as (
+
+    select id,
+
+           ts_rank_cd(fts_body, websearch_to_tsquery($query_text)) as rank_score,
+
+           row_number() over (order by ts_rank_cd(fts_body, websearch_to_tsquery($query_text)) desc) as rank_ix
+
+    from documents
+
+    where fts_body @@ websearch_to_tsquery($query_text)
+
+    order by rank_ix
+
+    limit least($match_count, 30)
+
+),
+
+...
+And the combined query
+
+select
+
+    documents.*,
+
+    coalesce(1.0 / ($rrf_k + fuzzy.rank_ix), 0.0) * $fuzzy_weight +
+
+    coalesce(1.0 / ($rrf_k + fts_title.rank_ix), 0.0) * $fts_title_weight +
+
+    coalesce(1.0 / ($rrf_k + fts_body.rank_ix), 0.0) * $fts_body_weight +
+
+    coalesce(1.0 / ($rrf_k + semantic.rank_ix), 0.0) * $semantic_weight as combined_rank,
+
+    json_build_object(
+
+        'fuzzy', json_build_object('rank_ix', fuzzy.rank_ix, 'sim_score', fuzzy.sim_score),
+
+        'fts_title', json_build_object('rank_ix', fts_title.rank_ix, 'rank_score', fts_title.rank_score),
+
+        'fts_body', json_build_object('rank_ix', fts_body.rank_ix, 'rank_score', fts_body.rank_score), 
+
+        'semantic', json_build_object('rank_ix', semantic.rank_ix, 'cosine_similarity', semantic.cosine_similarity)
+
+    ) as debug_rankings
+
+from fuzzy
+
+full outer join fts_title on fuzzy.id = fts_title.id
+
+full outer join fts_body on coalesce(fuzzy.id, fts_title.id) = fts_body.id
+
+full outer join semantic on coalesce(fuzzy.id, fts_title.id, fts_body.id) = semantic.id
+
+join documents on coalesce(fuzzy.id, fts_title.id, fts_body.id, semantic.id) = documents.id
+
+order by combined_rank desc
+
+limit least($match_count, 30);
+Adjusting for length
+If you read the documentation for ts_rank_cd you saw that there’s a normalization parameter. If not, here it is:
+
+Both ranking functions take an integer normalization option that specifies whether and how a document’s length should impact its rank. The integer option controls several behaviors, so it is a bit mask: you can specify one or more behaviors using | (for example, 2|4).
+
+We can use these various options to:
+
+Adjust for document length bias
+Balance relevance across diverse document sets
+Scale ranking results for consistent presentation
+Document Length Normalization
+
+Option Value	When to Use	Use Case
+No normalization (0)	When you want raw ranking scores without adjustments	Comparing documents of similar length and structure
+Log length normalization (1)	When you want to mildly reduce the impact of document length	Mixed-length documents where longer docs shouldn’t dominate
+Length normalization (2)	When you want to strongly normalize by document length	Diverse document lengths where content density matters more than total matches
+Harmonic mean distance (ts_rank_cd only) (4)	When you want to consider term proximity in ranking	Phrases or closely related terms are important in your search
+Unique word normalization (8)	When you want to favor documents with more diverse vocabulary	Rewarding content richness over repetition
+Log unique word normalization (16)	When you want to mildly reduce the impact of vocabulary diversity	Balancing between vocabulary richness and raw term frequency
+Scaling to 0-1 range (32)	When you need a consistent score range for all queries	Displaying scores as percentages or progress bars
+Combine options using bitwise OR (|) for more nuanced normalization. For example:
+
+Use 2|4 to normalize by both length and term proximity Use 1|8 for a balanced approach considering both document length and vocabulary diversity
+
+I’ve found good results with setting 0 (no normalization) for the title and 1 (logarithmic doc length) for the body. Again, I encourage you to experiment with different options to find the best fit for your use case.
+
+Reranking with cross-encoder
+Many retrieval systems are two-step based. This means you’ll use a bi-directional encoder to retrieve the initial N results, then a cross-encoder to rank these against the search query.
+
+The bi-encoder is fast, making it great for searching a multitude of documents. The cross-encoder is slower but more performant, making it great for reranking retrieved results.
+
+Cross-encoders differ from bi-encoders in that they process the query and document together, allowing for more nuanced understanding of the relationship between them. This results in better ranking accuracy but at the cost of computation time and scalability. Here’s a simple diagram to illustrate the process:
+
+FTS
+documents
+Semantic Search
+documents
+Fuzzy
+documents
+Rerank with Cross-encoder model
+Final documents
+There are a bunch of different tools out there to do this. One of the best is Cohere’s Rerankfavicon for cohere.com. Another way is to build your own with GPT from OpenAIfavicon for cookbook.openai.com.
+
+Boosting results to improve UX
+To provide an even better user experience, you might want to boost certain columns depending on your use case. For example, in a knowledge search, you might want to boost search results that the user has interacted with. You also might want to boost recently changed results.
+
+Boosting recent results or user-specific results can improve UX because it personalizes the search experience. Recent results are often more relevant, especially for time-sensitive information. User-specific boosts can surface content the user has previously found useful, making their search more efficient.
+
+After Boosting
+Before Boosting
+1. Result A
+2. Result B
+3. Result C
+4. Result D
+5. Result E
+1. Result C
+2. Result A
+3. Result E
+4. Result B
+5. Result D
+Assuming we have updated_at and updated_by columns in our documents table, we could implement it like this:
+
+select
+
+    ...
+
+    -- Recency boost
+
+    (1 + $recency_boost * (1 - extract(epoch from (now() - documents.updated_at)) / extract(epoch from (now() - '2020-01-01'::timestamp)))) *
+
+    -- User boost
+
+    case when documents.updated_by = $current_user_id then (1 + $user_boost) else 1 end
+
+    as combined_rank,
+
+    json_build_object(
+
+        ...
+
+        'recency_boost', (1 - extract(epoch from (now() - documents.updated_at)) / extract(epoch from (now() - '2020-01-01'::timestamp))),
+
+        'user_boost', case when documents.updated_by = $current_user_id then $user_boost else 0 end
+
+    ) as debug_rankings
+When should I look for alternative solutions?
+While Postgres is a solid choice for many search scenarios, it’s not without limitations. The lack of advanced algorithms like BM25 can be felt when dealing with diverse document lengths. Postgres’s reliance on TF-IDF for full-text search can struggle with very long documents and rare terms in large collections.
+
+Edit: Postgres actually doesn’t use TF-IDF for full-text search. Its built-in ranking functions (ts_rank and ts_rank_cd) primarily consider term frequency within individual documents and term proximity, but don’t take into account corpus-wide statistics. This approach can still struggle with very long documents and doesn’t inherently account for the rarity of terms across the entire collection.
+
+Make sure to measure before you look into alternative solutions. Chances are, it might not be worth it.
+
+Bonus: adding BM25
+Unlike Postgres’s FTS, BM25 considers corpus-wide statistics and document length normalization. Here are some of the reaons you might want to use it:
+
+Better handling of document length variations
+Improved relevance for rare terms
+Accounts for diminishing returns of term frequency
+Industry standard in information retrieval
+And here are some extensions you can install go get BM25 going:
+
+pg_searchfavicon for github.com
+pg_bestmatch.rsfavicon for github.com
+Conclusion
+We’ve covered a lot of ground in this post, from basic full-text search to advanced techniques like fuzzy matching, semantic search, and result boosting. By leveraging Postgres’s powerful features, you can create a robust and flexible search engine tailored to your specific needs.
+
+Postgres might not be the first tool that comes to mind for search, but it gets you really far.
+
+Remember, the key to a great search experience is continuous iteration and fine-tuning. Use the debugging techniques we discussed to understand how your search is performing, and don’t be afraid to adjust weights and parameters based on user feedback and behavior.
+
+Let me know if I missed anything! :)
